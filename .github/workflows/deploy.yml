@@ -1,0 +1,97 @@
+name: Deploy Frontend
+
+on:
+  push:
+    branches: [master, main]
+
+concurrency:
+  group: deploy-fe
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache Next.js
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            ${{ github.workspace }}/.next/cache
+          key: ${{ runner.os }}-nextjs-${{ hashFiles('**/package-lock.json') }}-${{ hashFiles('**/*.js', '**/*.jsx', '**/*.ts', '**/*.tsx') }}
+          restore-keys: |
+            ${{ runner.os }}-nextjs-${{ hashFiles('**/package-lock.json') }}-
+
+      - name: Install & Build
+        run: |
+          rm -rf node_modules
+          npm ci
+          echo "commit=${{ github.sha }}" > public/BUILD_INFO.txt
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> public/BUILD_INFO.txt
+          npm run build
+
+      - name: Prepare server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            sudo /www/server/panel/pyenv/bin/python /www/server/panel/script/nodejs-service.py BJM_FE stop || true
+            sudo mkdir -p /www/wwwroot/BJM/FE /www/wwwroot/BJM
+            sudo rm -rf /www/wwwroot/BJM/FE/* /www/wwwroot/BJM/FE/.[!.]* /www/wwwroot/BJM/.next /www/wwwroot/BJM/standalone 2>/dev/null || true
+            sudo chown -R nazruldev:nazruldev /www/wwwroot/BJM
+
+      - name: Upload standalone
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: ".next/standalone"
+          target: /www/wwwroot/BJM
+
+      - name: Upload .env
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: ".env.production"
+          target: "/www/wwwroot/BJM/FE"
+
+      - name: Deploy ke FE & start
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            D="/www/wwwroot/BJM/FE"
+            T="/www/wwwroot/BJM/.next/standalone"
+            [ -d "$T" ] || T="/www/wwwroot/BJM/standalone"
+            APP_DIR=""
+            for dir in "$T"/*/; do
+              [ -d "$dir" ] || continue
+              [ "$(basename "$dir")" = "node_modules" ] && continue
+              APP_DIR="$dir"
+              break
+            done
+            sudo cp "$T/server.js" "$T/package.json" "$D/" 2>/dev/null || true
+            sudo cp -r "$T/node_modules" "$D/"
+            sudo cp -r "$APP_DIR"* "$D/" 2>/dev/null || true
+            for f in "$APP_DIR".*; do
+              [ -e "$f" ] && [ "$(basename "$f")" != ".next" ] && sudo cp -r "$f" "$D/" 2>/dev/null || true
+            done
+            [ -d "$APP_DIR.next" ] && sudo mkdir -p "$D/.next" && sudo cp -r "$APP_DIR.next"/* "$D/.next/"
+            [ -f "$D/.env.production" ] && sudo mv "$D/.env.production" "$D/.env"
+            sudo rm -rf /www/wwwroot/BJM/.next /www/wwwroot/BJM/standalone
+            sudo chown -R www:www "$D"
+            sudo /www/server/panel/pyenv/bin/python /www/server/panel/script/nodejs-service.py BJM_FE start
+            echo "Deploy selesai: $D"
